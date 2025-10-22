@@ -21,6 +21,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+
 #from osmnx.utils_graph import route_to_geometry  # บางเวอร์ชันต้อง import แบบนี้
 
 
