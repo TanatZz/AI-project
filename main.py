@@ -21,6 +21,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from itertools import islice
 
 #from osmnx.utils_graph import route_to_geometry  # บางเวอร์ชันต้อง import แบบนี้
 
@@ -248,6 +249,69 @@ def collapse_to_simple_digraph(G, weight='weight'):
                        travel_time=data.get('travel_time'))
     return H
 
+def route_edge_set(G, route, undirected=True):
+    """แปลง route -> เซ็ตของขอบ (ไว้เช็คความซ้ำ)"""
+    S = set()
+    for u, v in zip(route[:-1], route[1:]):
+        S.add(frozenset((u, v)) if undirected else (u, v))
+    return S
+
+def jaccard_distance(S1, S2):
+    inter = len(S1 & S2)
+    union = len(S1 | S2)
+    return 1.0 - (inter / union if union else 0.0)
+
+def k_diverse_paths(G, orig, dest, k=4, weight="weight",
+                    candidates=30, min_diversity=0.35, penalty_factor=1.3, max_penalty=5.0):
+    """
+    คืนรายการเส้นทาง k เส้นที่ 'แตกต่างกัน' อย่างน้อย min_diversity
+    ขั้นแรกเลือกจาก shortest_simple_paths จำนวน candidates แล้วกรองด้วย Jaccard
+    ถ้ายังไม่ครบ k ให้ทำ penalty บนขอบของเส้นที่ถูกเลือกไปแล้ว
+    """
+    # 1) ผู้สมัครเบื้องต้น
+    gen = nx.shortest_simple_paths(G, orig, dest, weight=weight)
+    cand_routes = list(islice(gen, candidates))
+    if not cand_routes:
+        return []
+
+    selected = [cand_routes[0]]
+    selected_sets = [route_edge_set(G, cand_routes[0])]
+
+    # 2) กรองด้วย diversity
+    for r in cand_routes[1:]:
+        S = route_edge_set(G, r)
+        if all(jaccard_distance(S, S0) >= min_diversity for S0 in selected_sets):
+            selected.append(r)
+            selected_sets.append(S)
+            if len(selected) == k:
+                return selected
+
+    # 3) ยังไม่ครบ -> penalty routing
+    cur_pen = penalty_factor
+    while len(selected) < k and cur_pen <= max_penalty:
+        Gp = G.copy()
+        # เพิ่มน้ำหนักให้เส้นที่เลือกแล้ว เพื่อบังคับให้หลบ
+        for r in selected:
+            for u, v in zip(r[:-1], r[1:]):
+                if Gp.has_edge(u, v):
+                    for key, data in Gp[u][v].items() if isinstance(Gp[u][v], dict) else [(None, Gp[u][v])]:
+                        if weight in data:
+                            data[weight] *= cur_pen
+
+        try:
+            r_new = nx.shortest_path(Gp, orig, dest, weight=weight)
+        except nx.NetworkXNoPath:
+            break
+
+        S_new = route_edge_set(G, r_new)
+        if all(jaccard_distance(S_new, S0) >= min_diversity for S0 in selected_sets):
+            selected.append(r_new)
+            selected_sets.append(S_new)
+        else:
+            # ถ้ายังคล้ายมากขึ้นอีกหน่อย
+            cur_pen *= 1.15
+
+    return selected
 
 
 def k_best_paths(G, source, target, k=2, weight='weight'):
@@ -333,33 +397,57 @@ def route_to_latlon_coords(G, route):
 
 def save_folium_map(G, routes, origin_ll, dest_ll, filepath='routes.html'):
     import folium
-    # เบสแมพ
+
     center = [(origin_ll[0] + dest_ll[0]) / 2.0, (origin_ll[1] + dest_ll[1]) / 2.0]
     m = folium.Map(location=center, zoom_start=13, tiles='cartodbpositron')
 
-    # วาดโครงข่ายถนนแบบบางๆ (ถ้าใหญ่ไปจะช้า—ตัดทิ้งได้)
+    # โครงข่ายบางๆ (optional)
     try:
         nodes_gdf, edges_gdf = ox.graph_to_gdfs(G)
         folium.GeoJson(
             edges_gdf[['geometry']].to_json(),
             name='Network',
-            style_function=lambda x: {'color': '#B8BCC3', 'weight': 1, 'opacity': 0.6}
+            style_function=lambda x: {'color': '#B8BCC3', 'weight': 1, 'opacity': 0.55}
         ).add_to(m)
     except Exception:
         pass
 
-    # วาดเส้นทาง
-    colors = ['#E74C3C', '#2ECC71', '#3498DB', '#9B59B6']
+    # วาดเส้น Main/Alt
+    palette = ["#007AFF", "#34C759", "#FF9500", "#AF52DE"]
     for i, r in enumerate(routes):
-        coords = route_to_latlon_coords(G, r)  # << ใช้ของเราเอง ไม่พึ่ง ox.utils_graph
-        folium.PolyLine(locations=coords, weight=6, opacity=0.95,
-                        color=colors[i % len(colors)], tooltip=f"Route {i+1}").add_to(m)
+        # สรุประยะ/เวลาเพื่อทำ tooltip
+        s = path_summary(G, r)
+        km, mins = s['km'], s['minutes']
+        coords = route_to_latlon_coords(G, r)
+
+        is_main = (i == 0)
+        folium.PolyLine(
+            locations=coords,
+            color=palette[i % len(palette)],
+            weight=7 if is_main else 4,
+            opacity=0.95 if is_main else 0.65,
+            dash_array=None if is_main else "7,10",
+            tooltip=f"Route {i+1} {'(Main)' if is_main else '(Alt)'} — {km:.2f} km, {mins:.1f} min"
+        ).add_to(m)
 
     # หมุดต้น-ปลาย
     folium.Marker(origin_ll, icon=folium.Icon(color='blue', icon='play'), tooltip='Origin').add_to(m)
     folium.Marker(dest_ll,   icon=folium.Icon(color='green', icon='flag'), tooltip='Destination').add_to(m)
 
-    # ซูมอัตโนมัติ
+    # Legend
+    legend_html = """
+    <div style="position: fixed; bottom: 18px; left: 12px; z-index: 9999;
+                background: white; padding: 8px 12px; border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,.18); font-size: 13px; line-height: 1.4;">
+      <div style="margin-bottom: 4px;"><b>Routes</b></div>
+      <div><span style="display:inline-block;width:14px;height:4px;background:#007AFF;margin-right:6px;"></span>Route 1 (Main)</div>
+      <div><span style="display:inline-block;width:14px;height:4px;background:#34C759;margin-right:6px;"></span>Route 2 (Alt)</div>
+      <div><span style="display:inline-block;width:14px;height:4px;background:#FF9500;margin-right:6px;"></span>Route 3 (Alt)</div>
+      <div><span style="display:inline-block;width:14px;height:4px;background:#AF52DE;margin-right:6px;"></span>Route 4 (Alt)</div>
+    </div>
+    """
+    folium.Marker(origin_ll, icon=folium.DivIcon(html=legend_html)).add_to(m)
+
     m.fit_bounds([origin_ll, dest_ll])
     m.save(filepath)
     return filepath
@@ -378,6 +466,10 @@ def main():
     parser.add_argument('--k', type=int, default=2, help='จำนวนเส้นทางที่ต้องการ (ดีฟอลต์ 2)')
     parser.add_argument('--no-plot', action='store_true', help='ไม่ต้องสร้างรูปภาพเส้นทาง')
     parser.add_argument('--place', default='Songkhla Province, Thailand', help='ขอบเขต OSM (ดีฟอลต์ทั้งจังหวัดสงขลา)')
+    parser.add_argument('--candidates', type=int, default=30, help='จำนวนเส้นทางผู้สมัครก่อนคัดกรองความหลากหลาย (default 30)')
+    parser.add_argument('--diversity', type=float, default=0.35, help='เกณฑ์ความต่าง (Jaccard) ขั้นต่ำของเส้นทาง (0–1, default 0.35)')
+    parser.add_argument('--penalty', type=float, default=1.3, help='ตัวคูณลงโทษเส้นที่เลือกแล้วตอนหาเส้นรอง (default 1.3)')
+
     args = parser.parse_args()
 
     tz = pytz.timezone(args.tz)
@@ -400,7 +492,14 @@ def main():
     orig_node, dest_node, orig_ll, dest_ll = nearest_nodes_from_points(Gw, args.origin, args.destination)
 
     print(f"[6/6] หา {args.k} เส้นทางที่ดีที่สุด (ตามเวลาที่คาดการณ์)")
-    routes = k_best_paths(Gw, orig_node, dest_node, k=args.k, weight='weight')
+    routes = k_diverse_paths(
+    Gw, orig_node, dest_node,
+    k=args.k, weight='weight',
+    candidates=args.candidates,
+    min_diversity=args.diversity,
+    penalty_factor=args.penalty
+    )
+
     if not routes:
         print("❌ ไม่พบเส้นทางที่เป็นไปได้ในช่วงเวลานี้ (กราฟอาจขาดเพราะถนนปิด)")
         sys.exit(2)
